@@ -13,6 +13,12 @@ process. Those tests instead assert the observable proxy fallback path
 (offline HTML / status code) which is what the proxy returns whenever
 the upstream is unreachable, which is the case for any session created
 purely via the HTTP API in this layer.
+
+Since none of these tests need a running Next.js process (only a session with a
+sandbox row + allocated port), they reuse the module-scoped ``shared_session``.
+Each scope-dependent test sets the scope it needs, and the owner-access tests
+are scope-independent, so sharing is safe. The cross-session isolation test
+needs two distinct sessions, so it provisions its own.
 """
 
 from __future__ import annotations
@@ -86,7 +92,9 @@ def _auth_get(
 # ---------------------------------------------------------------------------
 
 
-def test_proxy_requires_auth_when_private(admin_user: DATestUser) -> None:
+def test_proxy_requires_auth_when_private(
+    shared_session: tuple[DATestUser, UUID],
+) -> None:
     """Private session + no token → proxy returns 401-equivalent.
 
     The handler raises ``HTTPException(401)`` from ``_check_webapp_access``;
@@ -94,10 +102,9 @@ def test_proxy_requires_auth_when_private(admin_user: DATestUser) -> None:
     instead of bubbling the bare 401 so the browser UX is sensible.
     Either response (401 status or 302 to login) means "auth required."
     """
-    session = _create_session(admin_user)
-    session_id = UUID(session["id"])
+    owner, session_id = shared_session
     # Default scope is PRIVATE; assert + be explicit anyway.
-    _set_scope(admin_user, session_id, SharingScope.PRIVATE)
+    _set_scope(owner, session_id, SharingScope.PRIVATE)
 
     response = _unauth_get(session_id, follow_redirects=False)
 
@@ -108,7 +115,7 @@ def test_proxy_requires_auth_when_private(admin_user: DATestUser) -> None:
 
 
 def test_proxy_allows_org_user_when_public_org(
-    admin_user: DATestUser,
+    shared_session: tuple[DATestUser, UUID],
     basic_user: DATestUser,
 ) -> None:
     """Different user in same tenant + ``public_org`` → access check passes.
@@ -119,9 +126,8 @@ def test_proxy_allows_org_user_when_public_org(
     asserting is that the request was *not* rejected by the access check
     (no 401, no 302 to login).
     """
-    session = _create_session(admin_user)
-    session_id = UUID(session["id"])
-    _set_scope(admin_user, session_id, SharingScope.PUBLIC_ORG)
+    owner, session_id = shared_session
+    _set_scope(owner, session_id, SharingScope.PUBLIC_ORG)
 
     response = client.get(
         _webapp_url(session_id),
@@ -137,7 +143,7 @@ def test_proxy_allows_org_user_when_public_org(
 
 
 def test_proxy_blocks_other_tenant_when_public_org(
-    admin_user: DATestUser,
+    shared_session: tuple[DATestUser, UUID],
 ) -> None:
     """Cross-tenant access on ``public_org`` → blocked.
 
@@ -149,9 +155,8 @@ def test_proxy_blocks_other_tenant_when_public_org(
     ``public_org`` rule (anonymous request → 401, since
     ``public_org`` requires auth).
     """
-    session = _create_session(admin_user)
-    session_id = UUID(session["id"])
-    _set_scope(admin_user, session_id, SharingScope.PUBLIC_ORG)
+    owner, session_id = shared_session
+    _set_scope(owner, session_id, SharingScope.PUBLIC_ORG)
 
     # Forged cookie: present but not a valid session for any user.
     response = client.get(
@@ -172,7 +177,9 @@ def test_proxy_blocks_other_tenant_when_public_org(
 # ---------------------------------------------------------------------------
 
 
-def test_proxy_strips_set_cookie_header(admin_user: DATestUser) -> None:
+def test_proxy_strips_set_cookie_header(
+    shared_session: tuple[DATestUser, UUID],
+) -> None:
     """``set-cookie`` is never forwarded from upstream.
 
     Without a live upstream, the proxy falls back to the offline HTML
@@ -181,23 +188,21 @@ def test_proxy_strips_set_cookie_header(admin_user: DATestUser) -> None:
     invariant we care about for security: no upstream-controlled cookie
     can ever reach the parent Onyx origin via this path.
     """
-    session = _create_session(admin_user)
-    session_id = UUID(session["id"])
+    owner, session_id = shared_session
 
-    response = _auth_get(admin_user, session_id, follow_redirects=False)
+    response = _auth_get(owner, session_id, follow_redirects=False)
 
     # Lowercased header name lookup (requests does case-insensitive matching).
     assert "set-cookie" not in {k.lower() for k in response.headers}
 
 
 def test_proxy_offline_html_does_not_leak_nextjs_asset_paths(
-    admin_user: DATestUser,
+    shared_session: tuple[DATestUser, UUID],
 ) -> None:
     """The offline fallback must not leak root-scoped Next.js asset URLs."""
-    session = _create_session(admin_user)
-    session_id = UUID(session["id"])
+    owner, session_id = shared_session
 
-    response = _auth_get(admin_user, session_id, follow_redirects=False)
+    response = _auth_get(owner, session_id, follow_redirects=False)
     assert "text/html" in response.headers.get("content-type", "").lower()
     body = response.text
     assert '"/_next/' not in body
@@ -205,19 +210,18 @@ def test_proxy_offline_html_does_not_leak_nextjs_asset_paths(
 
 
 def test_proxy_offline_html_does_not_include_hmr_shim(
-    admin_user: DATestUser,
+    shared_session: tuple[DATestUser, UUID],
 ) -> None:
     """The offline fallback should stay independent of Next.js dev HMR."""
-    session = _create_session(admin_user)
-    session_id = UUID(session["id"])
+    owner, session_id = shared_session
 
-    response = _auth_get(admin_user, session_id, follow_redirects=False)
+    response = _auth_get(owner, session_id, follow_redirects=False)
     body = response.text
     assert "__WEBAPP_BASE__" not in body
 
 
 def test_proxy_502_renders_branded_offline_page(
-    admin_user: DATestUser,
+    shared_session: tuple[DATestUser, UUID],
 ) -> None:
     """Pod down → branded offline HTML.
 
@@ -229,10 +233,9 @@ def test_proxy_502_renders_branded_offline_page(
     ``HTTPException`` raised inside ``_proxy_request`` carries 502
     before the offline page converts it to a 503 HTML response.
     """
-    session = _create_session(admin_user)
-    session_id = UUID(session["id"])
+    owner, session_id = shared_session
 
-    response = _auth_get(admin_user, session_id, follow_redirects=False)
+    response = _auth_get(owner, session_id, follow_redirects=False)
 
     assert response.status_code in (502, 503, 504)
     assert "text/html" in response.headers.get("content-type", "").lower()
@@ -249,7 +252,7 @@ def test_proxy_502_renders_branded_offline_page(
 
 
 def test_webapp_download_route_not_shadowed_by_catchall(
-    admin_user: DATestUser,
+    shared_session: tuple[DATestUser, UUID],
 ) -> None:
     """``/webapp-download`` resolves to the zip endpoint, not the catch-all.
 
@@ -265,13 +268,12 @@ def test_webapp_download_route_not_shadowed_by_catchall(
     a zip (200, ``application/zip``) or a 404 with JSON detail. Either
     is acceptable evidence that the *zip* endpoint matched.
     """
-    session = _create_session(admin_user)
-    session_id = UUID(session["id"])
+    owner, session_id = shared_session
 
     response = client.get(
         f"{API_SERVER_URL}/build/sessions/{session_id}/webapp-download",
-        headers=admin_user.headers,
-        cookies=admin_user.cookies,
+        headers=owner.headers,
+        cookies=owner.cookies,
         follow_redirects=False,
     )
 
@@ -302,6 +304,9 @@ def test_webapp_assets_isolated_across_sessions(
     (the owner of B) must not transparently fetch A's bytes — at best
     it triggers B's own offline page or its own routing logic, but it
     must not serve content from A's sandbox.
+
+    Provisions its own two sessions (two distinct users), so it does not
+    use ``shared_session``.
     """
     session_a = _create_session(admin_user)
     session_b = _create_session(basic_user)

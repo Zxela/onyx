@@ -79,10 +79,9 @@ def test_send_message_rejects_concurrent_active_turn(
 
 
 def test_send_message_404_for_other_users_session(
-    admin_user: DATestUser,
+    shared_session: tuple[DATestUser, uuid.UUID],
 ) -> None:
-    body = BuildSessionManager.create(admin_user)
-    session_id = body["id"]
+    _owner, session_id = shared_session
     other_user = UserManager.create(name=f"otheruser-{uuid.uuid4().hex[:8]}")
 
     response = client.post(
@@ -96,15 +95,14 @@ def test_send_message_404_for_other_users_session(
 
 
 def test_turn_events_requires_active_turn(
-    admin_user: DATestUser,
+    shared_session: tuple[DATestUser, uuid.UUID],
 ) -> None:
-    body = BuildSessionManager.create(admin_user)
-    session_id = uuid.UUID(body["id"])
+    owner, session_id = shared_session
 
     response = client.get(
         f"{API_SERVER_URL}/build/sessions/{session_id}/turns/{uuid.uuid4()}/events",
-        headers=admin_user.headers,
-        cookies=admin_user.cookies,
+        headers=owner.headers,
+        cookies=owner.cookies,
     )
 
     assert response.status_code == 409

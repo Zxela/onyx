@@ -25,8 +25,8 @@ def _upload_url(session_id: UUID) -> str:
     return f"{API_SERVER_URL}/build/sessions/{session_id}/upload"
 
 
-def test_upload_endpoint_201(admin_user: DATestUser) -> None:
-    """POST returns 201 with a body containing {filename, path, size_bytes}."""
+def test_upload_endpoint_returns_file_metadata(admin_user: DATestUser) -> None:
+    """POST returns a body containing {filename, path, size_bytes}."""
     session_id = _create_session_id(admin_user)
     body = BuildSessionManager.upload_file(
         admin_user,
@@ -40,10 +40,12 @@ def test_upload_endpoint_201(admin_user: DATestUser) -> None:
     assert body["size_bytes"] == len(b"hello world")
 
 
-def test_upload_endpoint_requires_auth(admin_user: DATestUser) -> None:
+def test_upload_endpoint_requires_auth(
+    shared_session: tuple[DATestUser, UUID],
+) -> None:
     """POST with no auth token returns 401 (or 403)."""
-    # admin_user is just used to ensure a session exists; we then strip auth.
-    session_id = _create_session_id(admin_user)
+    # The session just needs to exist; we then strip auth.
+    _owner, session_id = shared_session
 
     response = client.post(
         _upload_url(session_id),
@@ -57,10 +59,10 @@ def test_upload_endpoint_requires_auth(admin_user: DATestUser) -> None:
 
 
 def test_upload_endpoint_404_for_other_users_session(
-    admin_user: DATestUser, basic_user: DATestUser
+    shared_session: tuple[DATestUser, UUID], basic_user: DATestUser
 ) -> None:
     """Uploading to another user's session returns 404."""
-    foreign_session_id = _create_session_id(admin_user)
+    _owner, foreign_session_id = shared_session
 
     headers = {
         k: v for k, v in basic_user.headers.items() if k.lower() != "content-type"
@@ -74,25 +76,27 @@ def test_upload_endpoint_404_for_other_users_session(
     assert response.status_code == 404
 
 
-def test_upload_over_per_file_cap_returns_400(admin_user: DATestUser) -> None:
+def test_upload_over_per_file_cap_returns_400(
+    shared_session: tuple[DATestUser, UUID],
+) -> None:
     """A file exceeding the per-file cap is rejected with 400.
 
     The ``validate_file`` helper catches oversized files and the endpoint
     returns 400 (not 413) because the check is application-level, not a
     framework payload-size guard.
     """
-    session_id = _create_session_id(admin_user)
+    owner, session_id = shared_session
 
     # CI lowers BUILD_MAX_UPLOAD_FILE_SIZE_MB to 2; a 3 MiB payload trips it.
+    # The oversized file is rejected before it is written, so this adds nothing
+    # to the shared session's upload count/bytes.
     oversized = b"\x00" * (3 * 1024 * 1024)
-    headers = {
-        k: v for k, v in admin_user.headers.items() if k.lower() != "content-type"
-    }
+    headers = {k: v for k, v in owner.headers.items() if k.lower() != "content-type"}
     response = client.post(
         _upload_url(session_id),
         files={"file": ("big.txt", oversized, "application/octet-stream")},
         headers=headers,
-        cookies=admin_user.cookies,
+        cookies=owner.cookies,
     )
     # Per-file cap → 400 from validate_file.
     assert response.status_code == 400
@@ -179,7 +183,7 @@ def test_upload_accepts_any_extension_via_http(admin_user: DATestUser) -> None:
         headers=headers,
         cookies=admin_user.cookies,
     )
-    assert response.status_code == 201
+    assert response.status_code == 200
 
 
 def test_upload_with_unicode_filename_persists_correctly(

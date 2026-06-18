@@ -67,37 +67,42 @@ def test_create_session_requires_auth() -> None:
     assert response.status_code in (401, 403)
 
 
-def test_create_session_returns_201_with_session_and_sandbox_shape(
+def test_create_session_returns_200_with_session_and_sandbox_shape(
     admin_user: DATestUser,
     llm_provider: DATestLLMProvider,  # noqa: ARG001 — ensures a default LLM exists
 ) -> None:
-    """POST returns a body matching ``DetailedSessionResponse``."""
-    body = _create_session(admin_user)
-    # The endpoint declares ``response_model=DetailedSessionResponse``; FastAPI
-    # validates the shape on the way out. We just pin the fields the FE relies
-    # on so we'll notice if any are silently dropped.
-    assert body["id"]
+    """POST creates a session owned by the caller with a loaded sandbox."""
+    # FastAPI validates the full ``DetailedSessionResponse`` shape on the way
+    # out, so we only pin the FE-load-bearing values the framework can't
+    # guarantee: ownership, a non-null sandbox, and that the workspace was
+    # actually loaded into it.
+    response = client.post(
+        f"{API_SERVER_URL}/build/sessions",
+        json={"headless": False},
+        headers=admin_user.headers,
+        cookies=admin_user.cookies,
+    )
+    assert response.status_code == 200
+    body = response.json()
     assert body["user_id"] == admin_user.id
-    assert "status" in body
-    assert "created_at" in body
-    assert "sandbox" in body and body["sandbox"] is not None
-    assert "id" in body["sandbox"]
-    assert "status" in body["sandbox"]
+    assert body["sandbox"] is not None
     assert body["session_loaded_in_sandbox"] is True
-    assert "sharing_scope" in body
-    assert body["artifacts"] == [] or isinstance(body["artifacts"], list)
 
 
 def test_get_session_404_for_other_users_session(
-    admin_user: DATestUser,
-    llm_provider: DATestLLMProvider,  # noqa: ARG001
+    shared_session: tuple[DATestUser, uuid.UUID],
 ) -> None:
-    """Fetching another user's session by id returns 404 (ownership-gated)."""
-    owner_session = _create_session(admin_user)
+    """Fetching another user's session by id returns 404 (ownership-gated).
+
+    Ownership-gated and scope-independent (``get_session`` filters by user id),
+    so the module's shared session is fine here even if a sibling flips its
+    sharing scope.
+    """
+    _owner, session_id = shared_session
 
     other_user = UserManager.create(name=f"other-{uuid.uuid4().hex[:8]}")
     response = client.get(
-        f"{API_SERVER_URL}/build/sessions/{owner_session['id']}",
+        f"{API_SERVER_URL}/build/sessions/{session_id}",
         headers=other_user.headers,
         cookies=other_user.cookies,
     )
@@ -151,9 +156,8 @@ def test_delete_session_returns_204_and_actually_deletes(
 
 
 def test_set_sharing_scope_changes_webapp_visibility(
-    admin_user: DATestUser,
+    shared_session: tuple[DATestUser, uuid.UUID],
     basic_user: DATestUser,
-    llm_provider: DATestLLMProvider,  # noqa: ARG001
 ) -> None:
     """PATCH to public_org opens the webapp to other org members.
 
@@ -165,9 +169,12 @@ def test_set_sharing_scope_changes_webapp_visibility(
     sandbox has no Next.js dev server running and the proxy returns the
     offline page (status 5xx HTML), which still proves the auth gate is
     no longer applied.
+
+    Shares the module session: it starts ``private`` (only this test flips
+    scope) and the sibling ``get_session`` test is scope-independent.
     """
-    body = _create_session(admin_user)
-    session_id = body["id"]
+    owner, session_uuid = shared_session
+    session_id = str(session_uuid)
     webapp_url = f"{API_SERVER_URL}/build/sessions/{session_id}/webapp"
 
     # Private (default): an authenticated non-owner gets 404 (existence-hiding).
@@ -179,9 +186,7 @@ def test_set_sharing_scope_changes_webapp_visibility(
     )
     assert private_response.status_code == 404
 
-    BuildSessionManager.set_sharing(
-        admin_user, uuid.UUID(session_id), SharingScope.PUBLIC_ORG
-    )
+    BuildSessionManager.set_sharing(owner, session_uuid, SharingScope.PUBLIC_ORG)
 
     # public_org: same other org user reaches the proxy; with no upstream
     # Next.js dev server, the proxy returns the branded offline HTML (5xx).

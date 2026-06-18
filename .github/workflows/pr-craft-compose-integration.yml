@@ -84,6 +84,7 @@ jobs:
               - 'deployment/docker_compose/docker-compose.yml'
               - 'deployment/docker_compose/docker-compose.dev.yml'
               - 'deployment/docker_compose/docker-compose.craft.yml'
+              - 'backend/tests/integration/tests/craft/*.py'
               - 'backend/tests/integration/tests/craft/docker_e2e/**'
               - '.github/workflows/pr-craft-compose-integration.yml'
               - '.github/actions/setup-python-and-install-dependencies/**'
@@ -91,16 +92,24 @@ jobs:
   craft-compose-integration-test:
     needs: changes
     if: needs.changes.outputs.craft_compose == 'true'
-    # Self-hosted runs-on pool (matches pr-craft-k8s-tests /
-    # pr-integration-tests / pr-playwright-tests). Github's runners do not have
-    # sufficient disk space by default.
+    # Self-hosted runs-on pool. Github's runners lack sufficient disk by default.
+    # spot=false: the spot box repeatedly "lost communication with the server"
+    # ~24 min into the test step -- identical timing across 16 GB and 32 GB
+    # runners, so it's the spot instance being reclaimed, not OOM. On-demand
+    # removes the reclaim. 8cpu/32 GB keeps real headroom for the full stack
+    # (OpenSearch + 2 model servers + api/background/proxy) plus the per-test
+    # sandbox containers.
     runs-on:
       - runs-on
-      - runner=4cpu-linux-x64
+      - runner=8cpu-linux-x64
+      - spot=false
       - volume=100gb
       - run-id=${{ github.run_id }}-craft-compose-integration
       - extras=ecr-cache
-    timeout-minutes: 20
+    # ~5 min build/compose-up + the ~40-min test step + failure-handler/upload.
+    # The suite is provisioning-bound (~25 real-sandbox tests at ~1 min each);
+    # if this proves too long we shard it into parallel matrix jobs.
+    timeout-minutes: 50
 
     env:
       PYTHONPATH: ./backend
@@ -190,7 +199,12 @@ jobs:
             http://localhost:8080/health
 
       - name: Run integration tests
-        timeout-minutes: 10
+        # Root craft + docker_e2e. Real-sandbox provisioning is ~1 min each;
+        # shared_session keeps it to ~1/module, but ~25 tests still self-provision
+        # (uploads/message-turns/lifecycle). The prior run was still going at the
+        # 28-min mark, so budget 40 (well under the 50-min job cap so the always()
+        # log/artifact steps below run and surface --durations either way).
+        timeout-minutes: 40
         shell: bash
         # Working dir = backend/ so alembic.ini is a relative path for the
         # reset_all() fixture.
@@ -205,10 +219,19 @@ jobs:
           POSTGRES_PORT: "5432"
           REDIS_HOST: "127.0.0.1"
           REDIS_PORT: "6379"
+          # Override the workflow-level minio:9000 (compose-network only); from
+          # the runner host MinIO is the dev overlay's published port.
+          S3_ENDPOINT_URL: "http://127.0.0.1:9004"
+          # MinIO root creds (match env.template); without them the host-side
+          # client connects but MinIO returns 403 forbidden.
+          S3_AWS_ACCESS_KEY_ID: "minioadmin"
+          S3_AWS_SECRET_ACCESS_KEY: "minioadmin"
           # The integration framework imports onyx.* at module load and needs
           # craft + proxy env in place so DockerSandboxManager initializes.
           ENABLE_CRAFT: "true"
           ENABLE_PAID_ENTERPRISE_EDITION_FEATURES: "true"
+          # Matches the stack's .env; onyx.* fail-closes on an empty value at import.
+          USER_AUTH_SECRET: "craft-compose-ci-only-dummy-secret"
           SANDBOX_BACKEND: "docker"
           SANDBOX_PROXY_HOST: "sandbox-proxy"
           SANDBOX_PROXY_PORT: "8080"
@@ -219,6 +242,9 @@ jobs:
           # line-buffered flush so the file is up to date when that happens.
           set -o pipefail
           mkdir -p ../compose-logs
+          # Runs the docker-backed e2e suite plus the craft root API-boundary
+          # tests (session/message/file-ops/upload/user-library/proxy/scheduled
+          # HTTP contracts). The k8s subdir has its own dedicated lane.
           PYTHONUNBUFFERED=1 stdbuf -oL -eL py.test \
             -v \
             -s \
@@ -226,14 +252,15 @@ jobs:
             -o faulthandler_timeout=90 \
             --tb=short \
             --durations=10 \
-            tests/integration/tests/craft/docker_e2e \
+            tests/integration/tests/craft \
+            --ignore=tests/integration/tests/craft/k8s \
             2>&1 | tee ../compose-logs/pytest.log
 
       # Inline tail for fast triage in the GH Actions UI without downloading
       # artifacts. Truncated; the full per-container logs land in compose-logs/
       # via the next step and ship as an uploaded artifact.
       - name: Stack state + log tails on failure
-        if: ${{ failure() || cancelled() }}
+        if: ${{ always() }}
         run: |
           echo "=== docker ps -a ==="; docker ps -a || true
           echo "=== api_server tail ==="; docker logs --tail 200 onyx-api_server-1 || true
@@ -248,7 +275,7 @@ jobs:
       # runner shuts down. Captures both compose-managed services AND the
       # dynamically-created sandbox-<id> containers the tests provision.
       - name: Collect Docker logs on failure
-        if: ${{ failure() || cancelled() }}
+        if: ${{ always() }}
         run: |
           mkdir -p compose-logs
           # Compose-managed services (api_server, background, sandbox-proxy
@@ -272,7 +299,7 @@ jobs:
           done
 
       - name: Upload logs
-        if: ${{ failure() || cancelled() }}
+        if: ${{ always() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
           name: craft-compose-integration-logs
