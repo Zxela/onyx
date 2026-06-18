@@ -93,6 +93,7 @@ from onyx.secondary_llm_flows.source_filter import decide_search_scope
 from onyx.server.query_and_chat.placement import Placement
 from onyx.server.query_and_chat.streaming_models import Packet
 from onyx.server.query_and_chat.streaming_models import SearchToolDocumentsDelta
+from onyx.server.query_and_chat.streaming_models import SearchToolFilterDelta
 from onyx.server.query_and_chat.streaming_models import SearchToolQueriesDelta
 from onyx.server.query_and_chat.streaming_models import SearchToolStart
 from onyx.tools.interface import Tool
@@ -771,6 +772,18 @@ class SearchTool(Tool[SearchToolOverrideKwargs]):
             [s.value for s in resolved_scope] if resolved_scope else "all sources",
             next_source.value if next_source else "none",
         )
+
+        # Surface the applied connector filter to the UI (only when scoped — an
+        # unscoped search needs no filter chip).
+        if resolved_scope:
+            self.emitter.emit(
+                Packet(
+                    placement=placement,
+                    obj=SearchToolFilterDelta(
+                        sources=[source.value for source in resolved_scope]
+                    ),
+                )
+            )
 
         # The note appended to the response so the agent knows what was searched
         # and which source a follow-up search would scope to.
