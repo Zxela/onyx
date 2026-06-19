@@ -19,22 +19,31 @@ runs:
       run: |
         # Hash the contents of the specified requirement files
         hash=""
+        files=()
         while IFS= read -r req; do
           if [ -n "$req" ] && [ -f "$req" ]; then
             hash="$hash$(sha256sum "$req")"
+            files+=("$req")
           fi
         done <<< "$REQUIREMENTS"
         echo "hash=$(echo "$hash" | sha256sum | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+        # set_id namespaces the cache by *which* requirement files are installed
+        # (sorted list of paths, not their contents) so e.g. a default+dev job
+        # never restores or re-saves a default+dev+model_server+ee cache through
+        # restore-keys.
+        set_id=$(printf '%s\n' "${files[@]}" | sort | sha256sum | cut -c1-12)
+        echo "set_id=$set_id" >> "$GITHUB_OUTPUT"
 
-    # NOTE: This comes before Setup uv since clean-ups run in reverse chronological order
-    # such that Setup uv's prune-cache is able to prune the cache before we upload.
+    # restore-keys is scoped to set_id so a job only warm-starts from a cache
+    # built with the same set of requirement files; otherwise a small (e.g.
+    # default+dev) job restores and then re-saves a larger job's full cache.
     - name: Cache uv cache directory
       uses: runs-on/cache@a5f51d6f3fece787d03b7b4e981c82538a0654ed
       with:
         path: ~/.cache/uv
-        key: ${{ runner.os }}-uv-${{ steps.req-hash.outputs.hash }}
+        key: ${{ runner.os }}-uv-${{ steps.req-hash.outputs.set_id }}-${{ steps.req-hash.outputs.hash }}
         restore-keys: |
-          ${{ runner.os }}-uv-
+          ${{ runner.os }}-uv-${{ steps.req-hash.outputs.set_id }}-
 
     - name: Setup uv
       uses: astral-sh/setup-uv@ed21f2f24f8dd64503750218de024bcf64c7250a # ratchet:astral-sh/setup-uv@v7
@@ -88,3 +97,13 @@ runs:
         done <<< "$REQUIREMENTS"
         echo "Running: ${cmd[*]}"
         "${cmd[@]}"
+
+    - name: Prune uv cache for CI
+      shell: bash
+      run: |
+        # setup-uv only prunes when its own caching is enabled (enable-cache),
+        # which is off ("auto") on self-hosted runs-on runners — so prune here
+        # explicitly. --ci drops the unzipped archive-v0 wheels (cheap to
+        # recreate, ~half the cache) so the runs-on/cache upload stores only the
+        # zipped wheels and sdists.
+        uv cache prune --ci
